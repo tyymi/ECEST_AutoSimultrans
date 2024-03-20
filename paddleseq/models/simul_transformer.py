@@ -17,23 +17,24 @@ modify:
 2.add target key pad mask
 3.add forward_encoder,forward_decoder,reorder_encoder_out,reorder_incremental_state, in order to adapt to fairseq generator
 5.fairseq attn_drop=act_drop=0,paddle default attn_drop=act_drop=drop
-'''
 
+2023/3/1
+未初始化：transformer的linear1、linear2，attention的qkv bias
+
+待优化：
+1.加入prefix或context
+2.训练时的调度采样
+'''
 from __future__ import print_function
+import math
 import types
+import paddle
 import paddle.nn as nn
 import paddle.nn.functional as F
 from paddlenlp.transformers import PositionalEmbedding
-from fastcore.all import patch_to, partial, MethodType
-import functools
-import paddle
 import paddle.nn.initializer as I
-from paddle.nn.initializer import XavierNormal
-from paddle.nn.layer.transformer import (
-    _convert_attention_mask,
-    TransformerEncoderLayer,
-    TransformerDecoderLayer,
-)
+from fastcore.all import patch_to, partial
+from ppseq.modules.initializer import xavier_uniform_
 
 @patch_to(nn.Layer)
 def apply(self, fn, name=""):
@@ -44,77 +45,8 @@ def apply(self, fn, name=""):
     fn(self, name)
     return self
 
-
-def decorator(func, gain=1):
-    ''' decorate xavier norm to support paramater gain '''
-    @functools.wraps(func)
-    def wrappper(*args, **kwargs):
-        fan_in, fan_out = func(*args, **kwargs)
-        return fan_in / (gain ** 2), fan_out / (gain ** 2)
-
-    return wrappper
-
-
-def deepnorm_init(m, n, N=6, M=6):
-    ''' N:encoder layers, M: decoder layers '''
-    if "encoder" in n:
-        alpha = 0.81 * ((N ** 4) * M) ** (1 / 16)
-        beta = 0.87 * ((N ** 4) * M) ** -(1 / 16)
-    elif "decoder" in n:
-        alpha = (3 * M) ** (1 / 4)
-        beta = (12 * M) ** -(1 / 4)
-    else:
-        return
-    xavier_normal = XavierNormal()
-    xavier_normal_beta = XavierNormal()
-    xavier_normal_beta._compute_fans = decorator(
-        xavier_normal_beta._compute_fans, gain=beta
-    )
-    if isinstance(m, nn.Linear):
-        if any(x in n for x in ["linear1", "linear2", "v_proj", "out_proj"]):
-            xavier_normal_beta(m.weight)
-        elif any(x in n for x in ["q_proj", "k_proj"]):
-            xavier_normal(m.weight)
-    if isinstance(m, TransformerEncoderLayer) and "encoder" in n:
-        setattr(m, "alpha", alpha)
-    elif isinstance(m, TransformerDecoderLayer) and "decoder" in n:
-        setattr(m, "alpha", alpha)
-
-class EncoderLayer(nn.TransformerEncoderLayer):
-    def __init__(self, *args, **kwargs):
-        self.alpha = 1.0
-        super(EncoderLayer, self).__init__(*args, **kwargs)
-
-    def forward(self, src, src_mask=None, cache=None):
-        src_mask = _convert_attention_mask(src_mask, src.dtype)
-
-        residual = src
-        if self.normalize_before:
-            src = self.norm1(src)
-        # Add cache for encoder for the usage like UniLM
-        if cache is None:
-            src = self.self_attn(src, src, src, src_mask)
-        else:
-            src, incremental_cache = self.self_attn(src, src, src, src_mask,
-                                                    cache)
-
-        src = residual * self.alpha + self.dropout1(src)  # for deep norm
-        if not self.normalize_before:
-            src = self.norm1(src)
-
-        residual = src
-        if self.normalize_before:
-            src = self.norm2(src)
-        src = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = residual * self.alpha + self.dropout2(src)  # for deep norm
-        if not self.normalize_before:
-            src = self.norm2(src)
-        return src if cache is None else (src, incremental_cache)
-
-
 class DecoderLayer(nn.TransformerDecoderLayer):
     def __init__(self, *args, **kwargs):
-        self.alpha = 1.0
         super(DecoderLayer, self).__init__(*args, **kwargs)
 
     def forward(self, tgt, memory, tgt_mask=None, memory_mask=None, cache=None):
@@ -128,7 +60,7 @@ class DecoderLayer(nn.TransformerDecoderLayer):
         else:
             tgt, incremental_cache = self.self_attn(tgt, tgt, tgt, tgt_mask,
                                                     cache[0])
-        tgt = residual * self.alpha + self.dropout1(tgt)
+        tgt = residual + self.dropout1(tgt)
         if not self.normalize_before:
             tgt = self.norm1(tgt)
 
@@ -137,7 +69,7 @@ class DecoderLayer(nn.TransformerDecoderLayer):
         if self.normalize_before:
             tgt = self.norm2(tgt)
         if len(memory) == 1:
-            # Full sent # 自回归预测时走的这里,一次预测一个词
+            # Full sent # autoregressive
             tgt = self.cross_attn(tgt, memory[0], memory[0], memory_mask, None)
         else:
             # Wait-k policy # 训练时根据多个增长的src,预测多个tgt
@@ -153,7 +85,7 @@ class DecoderLayer(nn.TransformerDecoderLayer):
                 cross_attn_outputs.append(
                     self.cross_attn(q, e, e, memory_mask[:, :, :, :src_len], None))  # tgt取1个,src取前几个 e[bsz,len,dim]
             tgt = paddle.concat(cross_attn_outputs, axis=1)
-        tgt = residual * self.alpha + self.dropout2(tgt)
+        tgt = residual + self.dropout2(tgt)
         if not self.normalize_before:
             tgt = self.norm2(tgt)
 
@@ -161,7 +93,7 @@ class DecoderLayer(nn.TransformerDecoderLayer):
         if self.normalize_before:
             tgt = self.norm3(tgt)
         tgt = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-        tgt = residual * self.alpha + self.dropout3(tgt)
+        tgt = residual + self.dropout3(tgt)
         if not self.normalize_before:
             tgt = self.norm3(tgt)
         return tgt if cache is None else (tgt, (incremental_cache,))
@@ -237,7 +169,6 @@ class SimultaneousTransformer(nn.Layer):
                  nheads=8,
                  dim_feedforward=2048,
                  dropout=0.1,
-                 use_deepnorm=True, # deepnet
                  weight_sharing=False,
                  max_length=1024,
                  stream=False,
@@ -255,27 +186,29 @@ class SimultaneousTransformer(nn.Layer):
         self.unk_id = unk_id
         self.dropout = dropout
         self.waitk = waitk
-        self.use_deepnorm=use_deepnorm
         self.encoder_layers = encoder_layers
         self.decoder_layers = decoder_layers
         self.nheads = nheads
         self.d_model = d_model
         self.inf = 1e9
 
-        self.src_word_embedding = nn.Embedding(num_embeddings=src_vocab_size, embedding_dim=d_model,weight_attr=I.Normal(0, std=d_model ** -0.5))
+        self.src_word_embedding = nn.Embedding(num_embeddings=src_vocab_size, embedding_dim=d_model,
+                                               weight_attr=I.Normal(0, std=d_model ** -0.5))
         self.src_word_embedding.weight.stop_gradient = True
         self.src_word_embedding.weight[self.pad_id, :] = 0.
         self.src_word_embedding.weight.stop_gradient = False
         self.src_pos_embedding = PositionalEmbedding(
             emb_dim=d_model, max_length=max_length + self.pad_id + 1)
-        if weight_sharing and (src_vocab_size == tgt_vocab_size):
-            # assert src_vocab_size == tgt_vocab_size, (
-            #     "Vocabularies in source and target should be same for weight sharing."
-            # )
+        if weight_sharing:
+        # if False:
+            assert src_vocab_size == tgt_vocab_size, (
+                "Vocabularies in source and target should be same for weight sharing."
+            )
             self.tgt_word_embedding = self.src_word_embedding
             self.tgt_pos_embedding = self.src_pos_embedding
         else:
-            self.tgt_word_embedding = nn.Embedding(num_embeddings=tgt_vocab_size, embedding_dim=d_model,weight_attr=I.Normal(0, std=d_model ** -0.5))
+            self.tgt_word_embedding = nn.Embedding(num_embeddings=tgt_vocab_size, embedding_dim=d_model,
+                                                   weight_attr=I.Normal(0, std=d_model ** -0.5))
             self.tgt_word_embedding.weight.stop_gradient = True
             self.tgt_word_embedding.weight[self.pad_id, :] = 0.
             self.tgt_word_embedding.weight.stop_gradient = False
@@ -283,8 +216,7 @@ class SimultaneousTransformer(nn.Layer):
                 emb_dim=d_model, max_length=max_length + self.pad_id + 1)
         self.embed_scale = d_model ** 0.5
         # encoder_layer = nn.TransformerEncoderLayer(
-        # encoder_layer = nn.TransformerEncoderLayer(
-        encoder_layer = EncoderLayer(
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nheads,
             dim_feedforward=dim_feedforward,
@@ -315,13 +247,7 @@ class SimultaneousTransformer(nn.Layer):
         # self.decoder = self.modify_decoder(Decoder(decoder_layer=decoder_layer, num_layers=n_layer, norm=decoder_norm))
         self.decoder = Decoder(decoder_layer=decoder_layer, num_layers=self.decoder_layers, norm=decoder_norm)
 
-        # use deepnorm
-        if self.use_deepnorm:
-            deepnorm_init_fn=partial(deepnorm_init,N=encoder_layers,M=decoder_layers)
-            self.apply(deepnorm_init_fn)
-
-        if False:
-        # if weight_sharing:
+        if weight_sharing:
             self.linear = lambda x: paddle.matmul(
                 x=x, y=self.tgt_word_embedding.weight, transpose_y=True)
         else:
@@ -330,7 +256,25 @@ class SimultaneousTransformer(nn.Layer):
                 out_features=tgt_vocab_size,
                 bias_attr=False,
                 weight_attr=I.Normal(0, std=d_model ** -0.5))
+        self.apply(self.reset_paramaters)
 
+    def reset_paramaters(self,m,n): # model,name
+        if isinstance(m,nn.Linear):
+            in_features = m.weight.shape[0]
+            uniform_ = I.Uniform(-1 / math.sqrt(in_features), 1 / math.sqrt(in_features))
+            if any(x in n for x in ["q_proj", "k_proj", "v_proj"]):
+                xavier_uniform_(m.weight,gain=2**-0.5)
+                if m.bias is not None:
+                    uniform_(m.bias)
+            elif any(x in n for x in ["out_proj"]):
+                xavier_uniform_(m.weight)
+            elif any(x in n for x in ["linear1","linear2"]):
+                uniform_(m.weight)
+                if m.bias is not None:
+                    uniform_(m.bias)
+
+        # weight_attr = init.Uniform(-1 / math.sqrt(in_features), 1 / math.sqrt(in_features)),
+            # bias_attr = init.Uniform(-1 / math.sqrt(in_features), 1 / math.sqrt(in_features)) if bias else bias)
     def modify_encoder(self, encoder):
         ''' 为encoder添加新的函数,使其能在beamsearch时按照新的order重排 '''
 
@@ -350,8 +294,6 @@ class SimultaneousTransformer(nn.Layer):
 
         encoder.reorder_encoder_out = types.MethodType(reorder_encoder_out, encoder)
         return encoder
-
-
 
     def forward_encoder(self, src_word):
         # 1.embed
@@ -390,7 +332,7 @@ class SimultaneousTransformer(nn.Layer):
                 else:
                     # Wait-k policy
                     encoder_outs = []
-                    for i in range(self.waitk, src_max_len + 1):
+                    for i in range(self.waitk, src_max_len + 1): # 等待k个token，译文永远比原文慢k个token
                         enc_output = self.encoder(
                             enc_input[:, :i, :],
                             src_mask=src_mask[:, :, :, :i])
@@ -506,9 +448,10 @@ def base_architecture(args):
 
 
 cfgs = ['src_vocab_size', 'tgt_vocab_size', 'waitk']
+from ppseq.models import register_model_arch
 
-
-def transformer_simul_base_norm(is_test=False, pretrained_path=None, **kwargs):
+@register_model_arch("transformer_simul_base")
+def transformer_simul_base(is_test=False, pretrained_path=None, **kwargs):
     for cfg in cfgs: assert cfg in kwargs, f'missing argument:{cfg}'
     model_args = dict(encoder_layers=6,
                       decoder_layers=6,
@@ -520,7 +463,7 @@ def transformer_simul_base_norm(is_test=False, pretrained_path=None, **kwargs):
     model = _create_transformer('transformer_simul_base', is_test, pretrained_path, model_args)
     return model
 
-
+@register_model_arch("transformer_simul_big")
 def transformer_simul_big(is_test=False, pretrained_path=None, **kwargs):
     for cfg in cfgs: assert cfg in kwargs, f'missing argument:{cfg}'
     model_args = dict(encoder_layers=6,
@@ -533,8 +476,8 @@ def transformer_simul_big(is_test=False, pretrained_path=None, **kwargs):
     model = _create_transformer('transformer_simul_big', is_test, pretrained_path, model_args)
     return model
 
-
-def transformer_base_share_norm(is_test=False, pretrained_path=None, **kwargs):
+@register_model_arch("transformer_simul_base_share")
+def transformer_simul_base_share(is_test=False, pretrained_path=None, **kwargs):
     for cfg in cfgs: assert cfg in kwargs, f'missing argument:{cfg}'
     model_args = dict(encoder_layers=6,
                       decoder_layers=6,
@@ -544,34 +487,6 @@ def transformer_base_share_norm(is_test=False, pretrained_path=None, **kwargs):
                       weight_sharing=True,
                       **kwargs)
     model_args = base_architecture(model_args)
-    model = _create_transformer('transformer_simul_base', is_test, pretrained_path, model_args)
-    return model
-
-
-def transformer_deep_encoder(is_test=False, pretrained_path=None, **kwargs):
-    for cfg in cfgs: assert cfg in kwargs, f'missing argument:{cfg}'
-    model_args = dict(encoder_layers=12,
-                      decoder_layers=6,
-                      d_model=512,
-                      nheads=8,
-                      dim_feedforward=2048,
-                      weight_sharing=False,
-                      **kwargs)
-    model_args = base_architecture(model_args)
-    model = _create_transformer('transformer_deep_encoder', is_test, pretrained_path, model_args)
-    return model
-
-
-def deep_encoder_share(is_test=False, pretrained_path=None, **kwargs):
-    for cfg in cfgs: assert cfg in kwargs, f'missing argument:{cfg}'
-    model_args = dict(encoder_layers=12,
-                      decoder_layers=6,
-                      d_model=512,
-                      nheads=8,
-                      dim_feedforward=2048,
-                      weight_sharing=True,
-                      **kwargs)
-    model_args = base_architecture(model_args)
-    model = _create_transformer('deep_encoder_share', is_test, pretrained_path, model_args)
+    model = _create_transformer('transformer_base_share', is_test, pretrained_path, model_args)
     return model
 

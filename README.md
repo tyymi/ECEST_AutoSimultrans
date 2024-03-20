@@ -1,19 +1,19 @@
-# AutoSimultrans2022 PaddlePaddle Baseline
+# AutoSimultrans 
 
 ##  Background：
 
 Combining artificial intelligence technologies such as machine translation (MT), automatic speech recognition (ASR) and text-to-speech synthesis (TTS), simultaneous interpretation has developed into a cutting-edge research field with a wide range of applications in numerous scenarios, including international conferences, business negotiations, news presentations, legal proceedings and medical communication. As an emerging interdisciplinary field, simultaneous interpreting will face more challenges in the future.
 
-In order to promote the development of machine simultaneous interpretation technology, Baidu successfully bid for the 3rd Symposium on Simultaneous Interpretation at the NAACL 2022 Top Meeting, which brought together many researchers and practitioners in the fields of machine translation, speech processing and human interpretation to discuss the latest advances in simultaneous interpretation and the outstanding challenges faced today.
+In order to promote the development of machine simultaneous interpretation technology, Baidu successfully bid for the 3rd Symposium on Simultaneous Interpretation at the NAACL Top Meeting, which brought together many researchers and practitioners in the fields of machine translation, speech processing and human interpretation to discuss the latest advances in simultaneous interpretation and the outstanding challenges faced today.
 
 ## About this repo
 
-This repo is based on PaddlePaddle framework, using bpe-based Transformer as the translation model and waitk strategy for simultaneous translation, and achieved the second place in [AutoSimulTrans22](https://aistudio.baidu.com/aistudio/competition/detail/148)in the English version of the track, finishing as the baseline for next year.
+This repo is based on PaddlePaddle framework, using bpe-based Transformer as the translation model and waitk strategy for simultaneous translation, and achieved the second place in [AutoSimulTrans22](https://aistudio.baidu.com/aistudio/competition/detail/148) in the English version of the track.
 
 ## Dataset
 
 
-| 数据集 | 语言方向  | 数量 |
+| Dataset | Language-pair | Size |
 |-------|-------|-------|
 | [CWMT21](http://mteval.cipsc.org.cn:81/agreement/AutoSimTrans) | Zh-En  | 9.1m |
 | CWMT21 | Zh mono  | 1m |

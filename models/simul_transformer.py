@@ -18,6 +18,7 @@ modify:
 3.add forward_encoder,forward_decoder,reorder_encoder_out,reorder_incremental_state, in order to adapt to fairseq generator
 5.fairseq attn_drop=act_drop=0,paddle default attn_drop=act_drop=drop
 '''
+
 from __future__ import print_function
 import numpy as np
 import types
